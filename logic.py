@@ -4,33 +4,22 @@ from datetime import datetime
 
 class InventoryLogic:
     def __init__(self):
-        """Inicializálás és az adatok betöltése/migrálása."""
+        """Inicializálja a készletet és a tranzakciós előzményeket."""
         self.products = data_manager.load_data()
-        self._migrate_data()
+        self.history = data_manager.load_history()
+        # Automatikus frissítés a 2.0-ás adatmodellre
+        self._migrate_2_0()
 
-    def _migrate_data(self):
-        """
-        Biztosítja a kompatibilitást a régebbi (1.0, 1.2) verziókkal.
-        Ha hiányoznak az 1.5-ös verzió mezői, alapértelmezett értékekkel pótolja őket.
-        """
+    def _migrate_2_0(self):
+        """Biztosítja, hogy minden termék rendelkezzen a 2.0-ás verzióhoz szükséges mezőkkel."""
         updated = False
         for p in self.products:
-            # 1.5 Új mező: Márka (Brand)
             if 'brand' not in p:
                 p['brand'] = "OTHER"
                 updated = True
-
-            # 1.5 Új mező: Minimum készlet figyelmeztetéshez
             if 'min_stock' not in p:
                 p['min_stock'] = 2
                 updated = True
-
-            # 1.5 Új mező: Utolsó módosítás időpontja
-            if 'last_update' not in p:
-                p['last_update'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                updated = True
-
-            # 1.2-es mezők ellenőrzése (ha 1.0-ról frissít valaki)
             if 'sold_count' not in p:
                 p['sold_count'] = 0
                 updated = True
@@ -44,15 +33,27 @@ class InventoryLogic:
         if updated:
             data_manager.save_data(self.products)
 
-    def get_all_products(self):
-        """Visszaadja a teljes terméklistát."""
-        return self.products
+    def _log_transaction(self, p_id, description, quantity, money_flow):
+        """
+        Belső naplózó rendszer.
+        Minden eseményt elment a history.json-ba időbélyeggel.
+        money_flow: pozitív ha bevétel (eladás), negatív ha költség (beszerzés).
+        """
+        log_entry = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "product_id": p_id,
+            "description": description,
+            "quantity": quantity,
+            "value": int(money_flow)
+        }
+        # Új bejegyzés az elejére (hogy a legfrissebb legyen legfelül)
+        self.history.insert(0, log_entry)
+
+        # Limitáljuk az előzményeket az utolsó 200 műveletre a sebesség miatt
+        data_manager.save_history(self.history[:200])
 
     def add_product(self, brand, model, storage, color, purchase_price, sale_price, stock, min_stock):
-        """
-        Új termék rögzítése minden adattal.
-        A márkaneveket automatikusan nagybetűssé alakítja a rendszerezés miatt.
-        """
+        """Új termék rögzítése és a kezdeti készlet naplózása."""
         new_id = max([p['id'] for p in self.products], default=0) + 1
 
         product = {
@@ -65,82 +66,83 @@ class InventoryLogic:
             "sale_price": int(sale_price),
             "stock": int(stock),
             "min_stock": int(min_stock),
-            "sold_count": 0,
-            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M")
+            "sold_count": 0
         }
 
         self.products.append(product)
         data_manager.save_data(self.products)
+
+        # Kezdeti készlet naplózása (mint egy beszerzés, de 0 költséggel jelölve az indulásnál)
+        self._log_transaction(new_id, f"INITIAL STOCK: {brand} {model}", int(stock), 0)
         return True
 
     def update_stock(self, product_id, amount):
         """
-        Készlet módosítása (beszerzés/eladás).
-        Automatikusan frissíti az utolsó módosítás dátumát.
+        Készletmódosítás (Beszerzés vagy Eladás).
+        Kiszámolja a pénzügyi hatást és naplózza a tranzakciót.
         """
         for p in self.products:
             if p['id'] == product_id:
                 if amount < 0:  # ELADÁS
                     sold_qty = abs(amount)
                     if p['stock'] < sold_qty:
-                        return False, "Hiba: Nincs elegendő készlet!"
+                        return False, "Hiba: Nincs elég készleten!"
+
                     p['stock'] -= sold_qty
                     p['sold_count'] += sold_qty
+                    # Bevétel kiszámítása (pozitív érték)
+                    money_impact = sold_qty * p['sale_price']
+                    desc = f"SALE: {p['brand']} {p['model']} (x{sold_qty})"
+
                 else:  # BESZERZÉS
                     p['stock'] += amount
+                    # Költség kiszámítása (negatív érték a naplóban)
+                    money_impact = -(amount * p['purchase_price'])
+                    desc = f"RESTOCK: {p['brand']} {p['model']} (x{amount})"
 
-                # Időbélyeg frissítése
-                p['last_update'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-
+                # Mentés és naplózás
+                self._log_transaction(p['id'], desc, amount, money_impact)
                 data_manager.save_data(self.products)
-                return True, "Készlet sikeresen frissítve!"
+                return True, "Tranzakció sikeresen rögzítve!"
 
-        return False, "Hiba: Termék nem található!"
+        return False, "Hiba: A termék nem található!"
+
+    def get_filtered_products(self, query="", low_stock_only=False):
+        """Keresés és szűrés a termékek között (márka vagy modell alapján)."""
+        results = self.products
+
+        if low_stock_only:
+            results = [p for p in results if p['stock'] <= p['min_stock']]
+
+        if query:
+            q = query.lower()
+            results = [p for p in results if q in p['model'].lower() or q in p['brand'].lower()]
+
+        return results
 
     def get_financials(self):
-        """
-        Összetett pénzügyi és készlet statisztikák számítása.
-        Visszaadja a bevételt, profitot, készletértéket és a kritikus készletszintet.
-        """
-        total_revenue = 0
-        total_cost = 0
-        total_inventory_value = 0
-        total_items_in_stock = 0
-        low_stock_alerts = 0
+        """Vállalati szintű pénzügyi elemzés (Bevétel, Profit, Profitráta, Készletérték)."""
+        total_revenue = sum(p['sold_count'] * p['sale_price'] for p in self.products)
+        total_cost = sum(p['sold_count'] * p['purchase_price'] for p in self.products)
+        inventory_value = sum(p['stock'] * p['purchase_price'] for p in self.products)
 
-        for p in self.products:
-            # Pénzügyek
-            total_revenue += p['sold_count'] * p['sale_price']
-            total_cost += p['sold_count'] * p['purchase_price']
-
-            # Raktár állapot
-            total_inventory_value += p['stock'] * p['purchase_price']
-            total_items_in_stock += p['stock']
-
-            # Figyelmeztetés, ha a készlet eléri vagy alulmúlja a minimumot
-            if p['stock'] <= p['min_stock']:
-                low_stock_alerts += 1
+        profit = total_revenue - total_cost
+        # Profitráta (Margin %) számítása
+        margin = (profit / total_revenue * 100) if total_revenue > 0 else 0
 
         return {
             "revenue": total_revenue,
-            "profit": total_revenue - total_cost,
-            "inv_value": total_inventory_value,
-            "total_items": total_items_in_stock,
-            "low_stock_count": low_stock_alerts
+            "profit": profit,
+            "margin": round(margin, 1),
+            "inv_value": inventory_value,
+            "low_stock_count": sum(1 for p in self.products if p['stock'] <= p['min_stock'])
         }
 
     def get_chart_data(self):
-        """
-        Adat-előkészítés a Dashboard grafikonjához.
-        Márkák szerint összesíti a raktárkészletet.
-        """
+        """Márkák szerinti készletmegoszlás a grafikonhoz."""
         brand_stats = {}
         for p in self.products:
             brand = p['brand']
             brand_stats[brand] = brand_stats.get(brand, 0) + p['stock']
-
-        # Ha üres a lista, ne legyen hiba
-        if not brand_stats:
-            return [], []
 
         return list(brand_stats.keys()), list(brand_stats.values())

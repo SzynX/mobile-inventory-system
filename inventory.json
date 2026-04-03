@@ -1,0 +1,14 @@
+[
+    {
+        "id": 1,
+        "brand": "APPLE",
+        "model": "Iphone 17",
+        "storage": "256GB",
+        "color": "Black",
+        "purchase_price": 200000,
+        "sale_price": 300000,
+        "stock": 3,
+        "min_stock": 1,
+        "sold_count": 2
+    }
+]
